@@ -11,29 +11,36 @@ import (
 
 var (
 	testConfig = Config{
-		Endpoints: []string{"http://127.0.0.1:2379"},
+		InitAddress: []string{"127.0.0.1:6379"},
+		Username:    "",
+		Password:    "woIuu1208",
+		SelectDB:    1,
 	}
-	testElectionPath = "/gocron/elector/"
 )
 
 func TestElectorSingleAcquire(t *testing.T) {
-	el, err := NewElector(context.Background(), testConfig, WithTTL(10))
+	el, err := NewElector(context.Background(), testConfig)
 	assert.Equal(t, nil, err)
 	sig := make(chan struct{}, 1)
 	go func() {
-		err := el.Start(testElectionPath + "single")
+		err := el.Start()
+
+		if err != nil {
+			fmt.Println("Error starting elector:", err)
+		}
+
 		assert.Equal(t, nil, err)
 		close(sig)
 	}()
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(15 * time.Second)
 	assert.Equal(t, nil, el.IsLeader(context.Background()))
 	assert.Equal(t, el.GetLeaderID(), el.GetID())
 	_ = el.Stop()
 
 	select {
 	case <-sig:
-	case <-time.After(2 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Error("elector exit timeout")
 	}
 
@@ -52,12 +59,17 @@ func TestElectorMultipleAcquire(t *testing.T) {
 		elections = append(elections, el)
 
 		go func() {
-			err := el.Start(testElectionPath + "multi")
+			err := el.Start()
+
+			if err != nil {
+				fmt.Println("Error starting elector:", err)
+			}
+
 			assert.Equal(t, nil, err)
 		}()
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(15 * time.Second)
 
 	var leaderCounter int
 	for _, el := range elections {
@@ -83,12 +95,11 @@ func TestElectorAcquireRace(t *testing.T) {
 	for i := 0; i < workers; i++ {
 		el, err := NewElector(context.Background(), testConfig, WithTTL(1))
 		assert.Equal(t, nil, err)
-		el.id = fmt.Sprintf("idx-%v", i)
 
 		elections = append(elections, el)
 
 		go func() {
-			err := el.Start(testElectionPath + "race")
+			err := el.Start()
 			assert.Equal(t, nil, err)
 		}()
 
@@ -126,7 +137,7 @@ func TestElectorStop(t *testing.T) {
 	el, err := NewElector(context.Background(), testConfig)
 	assert.Equal(t, nil, err)
 	_ = el.Stop()
-	err = el.Start(testElectionPath)
+	err = el.Start()
 	assert.Equal(t, err, ErrClosed)
 }
 

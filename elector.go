@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/client/v3/concurrency"
+	redis "github.com/redis/rueidis"
 )
 
 var (
@@ -20,66 +20,91 @@ var (
 	ErrNonLeader = errors.New("the elector is not leader")
 	// ErrClosed - the elector is already closed
 	ErrClosed = errors.New("the elector is already closed")
-	// ErrPingEtcd - ping etcd server timeout
-	ErrPingEtcd = errors.New("ping etcd server timeout")
-)
-
-// Vars and comments are copied from etcd clientv3
-var (
-	// WithTTL configures the session's TTL in seconds.
-	// If TTL is <= 0, the default 60 seconds TTL will be used.
-	WithTTL = concurrency.WithTTL
-	// WithContext assigns a context to the session instead of defaulting to
-	// using the client context. This is useful for canceling NewSession and
-	// Close operations immediately without having to close the client. If the
-	// context is canceled before Close() completes, the session's lease will be
-	// abandoned and left to expire instead of being revoked.
-	WithContext = concurrency.WithContext
-	// WithLease specifies the existing leaseID to be used for the session.
-	// This is useful in process restart scenario, for example, to reclaim
-	// leadership from an election prior to restart.
-	WithLease = concurrency.WithLease
+	// ErrPingRedis - ping redis server timeout
+	ErrPingRedis = errors.New("ping redis server timeout")
 )
 
 type (
-	// Config is an alias clientv3.config
-	Config = clientv3.Config
+	// Config is an alias redis.ClientOption
+	Config = redis.ClientOption
 )
 
-func nullLogger(_ ...interface{}) {}
+const (
+	script = `
+	if redis.call("get", KEYS[1]) == ARGV[1] then
+		return redis.call("pexpire", KEYS[1], ARGV[2])
+	else
+		if redis.call("exists", KEYS[1]) == 0 then
+			redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2], "NX")
+			return 1
+		end
+		
+		-- if the key exists but not owned by this instance, return 0
+		return 0
+	end
+	`
+)
 
-// Elector is a distributed leader election implementation using etcd.
+// Elector is a distributed leader election implementation using redis.
 type Elector struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	config  clientv3.Config
-	options []concurrency.SessionOption
-	client  *clientv3.Client
-	id      string
+	config        redis.ClientOption
+	client        redis.Client
+	id            string        // unique ID for the elector, internal use only!
+	ttl           time.Duration // TTL for the elector
+	renewInterval time.Duration // renew interval for the elector
+	key           string        // key for the elector, default is "/gocron/elector/"
 
 	mu       sync.RWMutex
 	closed   bool
 	isLeader bool
 	leaderID string
 
-	logger func(msg ...interface{})
+	logger *zap.SugaredLogger
 }
 
-// NewElector creates a new Elector instance with the given etcd config and options.
-func NewElector(ctx context.Context, cfg clientv3.Config, options ...concurrency.SessionOption) (*Elector, error) {
-	return newElector(ctx, nil, cfg, options...)
+type Option func(*Elector)
+
+// WithTTL sets the TTL for the elector.
+func WithTTL(ttl int) Option {
+	return func(e *Elector) {
+		e.ttl = time.Duration(ttl) * time.Second
+
+		jitter := time.Duration(mrand.Intn(500)) * time.Millisecond
+		e.renewInterval = e.ttl/3 + jitter // renew interval is 1/3 of TTL with some jitter
+	}
 }
 
-// NewElectorWithClient creates a new Elector instance with the given etcd client and options.
-func NewElectorWithClient(ctx context.Context, cli *clientv3.Client, options ...concurrency.SessionOption) (*Elector, error) {
-	return newElector(ctx, cli, Config{}, options...)
+// WithKey sets the key for the elector.
+func WithKey(key string) Option {
+	return func(e *Elector) {
+		e.key = key
+	}
 }
 
-func newElector(ctx context.Context, cli *clientv3.Client, cfg clientv3.Config, options ...concurrency.SessionOption) (*Elector, error) {
+// WithLogger sets the logger for the elector.
+func WithLogger(logger *zap.SugaredLogger) Option {
+	return func(e *Elector) {
+		e.logger = logger.Named("ELECTOR_CRON")
+	}
+}
+
+// NewElector creates a new Elector instance with the given redis config.
+func NewElector(ctx context.Context, cfg redis.ClientOption, opts ...Option) (*Elector, error) {
+	return newElector(ctx, nil, cfg, opts...)
+}
+
+// NewElectorWithClient creates a new Elector instance with the given etcd client.
+func NewElectorWithClient(ctx context.Context, cli redis.Client, opts ...Option) (*Elector, error) {
+	return newElector(ctx, cli, Config{}, opts...)
+}
+
+func newElector(ctx context.Context, cli redis.Client, cfg redis.ClientOption, opts ...Option) (*Elector, error) {
 	var err error
 	if cli == nil {
-		cli, err = clientv3.New(cfg) // async dial etcd
+		cli, err = redis.NewClient(cfg) // async dial redis
 		if err != nil {
 			return nil, err
 		}
@@ -87,25 +112,37 @@ func newElector(ctx context.Context, cli *clientv3.Client, cfg clientv3.Config, 
 
 	cctx, cancel := context.WithCancel(ctx)
 	el := &Elector{
-		ctx:     cctx,
-		cancel:  cancel,
-		config:  cfg,
-		options: options,
-		id:      getID(),
-		client:  cli,
-		logger:  nullLogger,
+		ctx:    cctx,
+		cancel: cancel,
+		config: cfg,
+		id:     getID(),
+		client: cli,
 	}
 
-	err = el.pingEtcd("/")
+	for _, opt := range opts {
+		opt(el)
+	}
+
+	// set defauls
+	if el.key == "" {
+		WithKey("elector:cron")(el) // default key is "elector:cron"
+	}
+
+	if el.ttl == 0 {
+		WithTTL(10)(el) // default TTL is 10 seconds
+	}
+
+	if el.logger == nil {
+		nopLogger := *zap.NewNop().Sugar()
+		WithLogger(&nopLogger)(el) // use a no-op logger if not provided
+	}
+
+	err = el.ping()
 	if err != nil {
 		return nil, err
 	}
-	return el, nil
-}
 
-// SetLogger sets the logger function for the elector.
-func (e *Elector) SetLogger(fn func(msg ...interface{})) {
-	e.logger = fn
+	return el, nil
 }
 
 // GetID returns the elector ID.
@@ -133,6 +170,7 @@ func (e *Elector) Stop() error {
 	e.cancel()
 	e.closed = true
 	e.client.Close()
+
 	return nil
 }
 
@@ -164,13 +202,14 @@ func (e *Elector) unsetLeader(id string) {
 	e.leaderID = id
 }
 
-func (e *Elector) pingEtcd(electionPath string) error {
+func (e *Elector) ping() error {
 	timeoutCtx, cancel := context.WithTimeout(e.ctx, 6*time.Second)
 	defer cancel()
 
-	_, _ = e.client.Get(timeoutCtx, electionPath)
+	_ = e.client.Do(timeoutCtx, e.client.B().Ping().Build())
+
 	if timeoutCtx.Err() == context.DeadlineExceeded {
-		return ErrPingEtcd
+		return ErrPingRedis
 	}
 	return nil
 }
@@ -179,56 +218,52 @@ func (e *Elector) pingEtcd(electionPath string) error {
 // This method will keep trying the election. When the election is successful, set isleader to true.
 // If it fails, the election directory will be monitored until the election is successful.
 // The parameter electionPath is used to specify the etcd directory for the operation.
-func (e *Elector) Start(electionPath string) error {
+func (e *Elector) Start() error {
+	e.logger.Infow("Starting elector", "id", e.id, "key", e.key, "ttl", e.ttl, "renewInterval", e.renewInterval)
 	if e.closed {
 		return ErrClosed
 	}
 
-	session, err := concurrency.NewSession(e.client, e.options...)
-	if err != nil {
-		return err
+	cmd := e.client.B().Set().Key(e.key).Value(e.id).Nx().Ex(e.ttl).Build()
+	resp := e.client.Do(e.ctx, cmd)
+
+	if err := resp.Error(); err != nil {
+		e.logger.Warnw("Another instance is likely the leader", "error", err)
 	}
-	defer session.Close()
-
-	electionHandler := concurrency.NewElection(session, electionPath)
-	go func() {
-		for e.ctx.Err() == nil {
-			// If the election cannot be obtained, it will be blocked until the election can be obtained.
-			if err := electionHandler.Campaign(e.ctx, e.id); err != nil {
-				e.logger(fmt.Errorf("election failed to campaign, err: %w", err))
-			}
-
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
 
 	defer func() {
 		// unset leader
 		e.unsetLeader("")
 	}()
 
-	ch := electionHandler.Observe(e.ctx)
+	ticker := time.NewTicker(e.renewInterval)
+	defer ticker.Stop()
+
 	for e.ctx.Err() == nil {
 		select {
-		case resp := <-ch:
-			if len(resp.Kvs) == 0 {
-				continue
-			}
+		case <-ticker.C:
+			cmd := e.client.B().Eval().Script(script).
+				Numkeys(1).
+				Key(e.key).
+				Arg(e.id).
+				Arg(fmt.Sprintf("%d", e.ttl.Milliseconds())).Build()
 
-			for i := 0; i < len(resp.Kvs); i++ {
-				val := string(resp.Kvs[i].Value)
-				if val != e.id {
-					e.unsetLeader(val)
-					e.logger("switch to non-leader, the current leader is ", val)
-					continue
+			res := e.client.Do(e.ctx, cmd)
+			if err := res.Error(); err != nil {
+				e.logger.Errorw("Error renewing lock:", "error", err, "id", e.id)
+			} else {
+				n, _ := res.AsInt64()
+				switch n {
+				case 1:
+					e.logger.Debugw("Lock renewed.", "id", e.id)
+					if e.IsLeader(e.ctx) != nil { // is non-leader
+						e.setLeader(e.id)
+						e.logger.Debugw("switch to leader, the current instance is leader", "id", e.id)
+					}
+				case 0:
+					e.logger.Warnw("Failed to renew lock, another instance may be the leader", "id", e.id)
 				}
-
-				if e.IsLeader(e.ctx) != nil { // is non-leader
-					e.setLeader(val)
-					e.logger("switch to leader, the current instance is leader")
-				}
 			}
-
 		case <-e.ctx.Done():
 			return nil
 		}
