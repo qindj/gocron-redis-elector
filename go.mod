@@ -16,7 +16,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-require github.com/redis/rueidis v1.0.63
+require github.com/redis/rueidis v1.0.64
 
 require (
 	github.com/kr/pretty v0.3.1 // indirect
