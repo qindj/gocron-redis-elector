@@ -1,8 +1,6 @@
 module github.com/qindj/gocron-redis-elector
 
-go 1.24.0
-
-toolchain go1.24.4
+go 1.24.9
 
 require github.com/stretchr/testify v1.11.1
 
@@ -12,11 +10,11 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1
-	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/sys v0.39.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-require github.com/redis/rueidis v1.0.64
+require github.com/redis/rueidis v1.0.70
 
 require (
 	github.com/kr/pretty v0.3.1 // indirect
